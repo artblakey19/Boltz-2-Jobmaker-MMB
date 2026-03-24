@@ -130,20 +130,20 @@ def fetch_sequence(identifier_tuple):
 
 def main():
     parser = argparse.ArgumentParser(description="Create Boltz-2 input yaml scripts for protein-ligand prediction.")
-    parser.add_argument("-t", "--tsv_files", required=True, nargs='+', help="Candidate proteins .tsv files (e.g. file1.tsv file2.tsv)")
+    parser.add_argument("-i", "--input_list", required=True, nargs='+', help="Input files containing protein list (.tsv or .fasta) (e.g. file1.tsv file2.fasta)")
     parser.add_argument("-s", "--smiles_file", required=True, help="Small molecule SMILES text file (e.g. CK6)")
-    parser.add_argument("-o", "--out_dirs", nargs='+', default=None, help="Output directories for YAML files (must match number of tsv_files if provided)")
+    parser.add_argument("-o", "--out_dirs", nargs='+', default=None, help="Output directories for YAML files (must match number of input_list files if provided)")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of parallel workers for downloading FASTA files")
-    parser.add_argument("-f", "--fasta", default=None, help="Path to a local FASTA file to search before downloading from UniProt")
+    parser.add_argument("--db", default=None, help="Path to a local FASTA database file to search before downloading from UniProt")
     parser.add_argument("--retry_log", default=None, help="Path to a log file containing failed downloads to retry")
     parser.add_argument("--error_log", default="failed_downloads.log", help="Path to save the failed downloads (default: failed_downloads.log)")
     parser.add_argument("--out_type", choices=['job', 'fasta', 'both'], default='job', help="Type of output to generate: 'job' for yaml only, 'fasta' for fasta only, 'both' for both (default: job)")
     parser.add_argument("--a3m", default=None, help="Directory containing .a3m files to include in the yaml job files")
-    
+
     args = parser.parse_args()
-    
-    if args.out_dirs is not None and len(args.out_dirs) != len(args.tsv_files):
-        print("Error: Number of output directories (-o/--out_dirs) must match the number of input TSV files (-t/--tsv_files).")
+
+    if args.out_dirs is not None and len(args.out_dirs) != len(args.input_list):
+        print("Error: Number of output directories (-o/--out_dirs) must match the number of input files (-i/--input_list).")
         return
 
     retry_ids = None
@@ -160,12 +160,12 @@ def main():
     # Determine output directories
     out_dirs = []
     fasta_dirs = []
-    for i, tsv_file in enumerate(args.tsv_files):
+    for i, input_file in enumerate(args.input_list):
         if args.out_dirs is not None:
             out_dir = args.out_dirs[i]
             fasta_dir = f"{out_dir}_fasta"
         else:
-            input_basename = os.path.splitext(os.path.basename(tsv_file))[0]
+            input_basename = os.path.splitext(os.path.basename(input_file))[0]
             out_dir = f"{input_basename}_job"
             fasta_dir = f"{input_basename}_fasta"
         out_dirs.append(out_dir)
@@ -185,61 +185,119 @@ def main():
     smiles_basename = os.path.splitext(os.path.basename(args.smiles_file))[0]
     
     seen_uniprots = {}
-    
-    # Parse TSVs to collect all unique uniprots
+
+    # Parse input files to collect all unique protein identifiers
     items_to_download = set()
-    tsv_data = [] # Store lines and logic info for later processing
-    
-    for tsv_file in args.tsv_files:
-        with open(tsv_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            
-        if not lines:
-            print(f"Warning: TSV file {tsv_file} is empty. Skipping.")
-            tsv_data.append((tsv_file, [], -1, None))
-            continue
-            
-        header = lines[0].strip('\n').split('\t')
-        try:
-            id_idx = header.index("source_uniprot")
-            id_type = "uniprot"
-        except ValueError:
+    input_data = [] # Store parsed data for later processing
+
+    for input_file in args.input_list:
+        file_ext = os.path.splitext(input_file)[1].lower()
+
+        if file_ext == '.fasta':
+            # Parse FASTA file - directly use sequences from file
+            with open(input_file, 'r', encoding='utf-8') as f:
+                fasta_lines = f.readlines()
+
+            if not fasta_lines:
+                print(f"Warning: FASTA file {input_file} is empty. Skipping.")
+                input_data.append((input_file, 'fasta', [], None, None))
+                continue
+
+            # Parse FASTA file to extract IDs and sequences
+            uniprot_ids = []
+            current_id = None
+            current_seq = []
+
+            for line in fasta_lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                if line.startswith('>'):
+                    # Save previous sequence if exists
+                    if current_id and current_seq:
+                        seq = "".join(current_seq)
+                        seen_uniprots[current_id] = seq
+                        uniprot_ids.append(current_id)
+
+                    # Parse new header
+                    # Format: >sp|P12345|PROTNAME or >P12345
+                    parts = line[1:].split()
+                    if parts:
+                        id_part = parts[0]
+                        id_split = id_part.split('|')
+                        if len(id_split) >= 2:
+                            current_id = id_split[1]  # UniProt ID from >sp|P12345|...
+                        else:
+                            current_id = id_split[0]  # UniProt ID from >P12345
+                        current_seq = []
+                else:
+                    # Sequence line
+                    current_seq.append(line)
+
+            # Save last sequence
+            if current_id and current_seq:
+                seq = "".join(current_seq)
+                seen_uniprots[current_id] = seq
+                uniprot_ids.append(current_id)
+
+            input_data.append((input_file, 'fasta', uniprot_ids, None, None))
+
+        elif file_ext == '.tsv':
+            # Parse TSV file (existing logic)
+            with open(input_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if not lines:
+                print(f"Warning: TSV file {input_file} is empty. Skipping.")
+                input_data.append((input_file, 'tsv', [], -1, None))
+                continue
+
+            header = lines[0].strip('\n').split('\t')
             try:
-                id_idx = header.index("gene_name")
-                id_type = "gene"
+                id_idx = header.index("source_uniprot")
+                id_type = "uniprot"
             except ValueError:
-                print(f"Warning: Neither 'source_uniprot' nor 'gene_name' column found in TSV header for {tsv_file}. Skipping.")
-                tsv_data.append((tsv_file, [], -1, None))
-                continue
-            
-        tsv_data.append((tsv_file, lines, id_idx, id_type))
-        
-        for i, line in enumerate(lines[1:], start=2):
-            line = line.strip('\n')
-            if not line:
-                continue
-                
-            parts = line.split('\t')
-            if len(parts) <= id_idx:
-                continue
-                
-            id_str = parts[id_idx]
-            if not id_str.strip():
-                continue
-                
-            if id_str.startswith("COMPLEX:"):
-                complex_ids = id_str.replace("COMPLEX:", "").split("_")
-                for c_id in complex_ids:
-                    if retry_ids is None or (c_id, id_type) in retry_ids:
-                        items_to_download.add((c_id, id_type))
-            else:
-                if retry_ids is None or (id_str, id_type) in retry_ids:
-                    items_to_download.add((id_str, id_type))
-                
+                try:
+                    id_idx = header.index("gene_name")
+                    id_type = "gene"
+                except ValueError:
+                    print(f"Warning: Neither 'source_uniprot' nor 'gene_name' column found in TSV header for {input_file}. Skipping.")
+                    input_data.append((input_file, 'tsv', [], -1, None))
+                    continue
+
+            input_data.append((input_file, 'tsv', lines, id_idx, id_type))
+
+            for i, line in enumerate(lines[1:], start=2):
+                line = line.strip('\n')
+                if not line:
+                    continue
+
+                parts = line.split('\t')
+                if len(parts) <= id_idx:
+                    continue
+
+                id_str = parts[id_idx]
+                if not id_str.strip():
+                    continue
+
+                if id_str.startswith("COMPLEX:"):
+                    complex_ids = id_str.replace("COMPLEX:", "").split("_")
+                    for c_id in complex_ids:
+                        if retry_ids is None or (c_id, id_type) in retry_ids:
+                            items_to_download.add((c_id, id_type))
+                else:
+                    if retry_ids is None or (id_str, id_type) in retry_ids:
+                        items_to_download.add((id_str, id_type))
+        else:
+            print(f"Warning: Unknown file type '{file_ext}' for {input_file}. Supported types: .tsv, .fasta. Skipping.")
+            input_data.append((input_file, 'unknown', [], None, None))
+            continue
+
     items_to_download = list(items_to_download)
-    
-    if args.fasta:
-        local_db = load_local_fasta(args.fasta)
+
+    if args.db:
+        local_db = load_local_fasta(args.db)
         items_to_fetch_from_web = []
         for item in items_to_download:
             identifier, id_type = item
@@ -249,12 +307,12 @@ def main():
                 seen_uniprots[identifier] = local_db['gene'][identifier]
             else:
                 items_to_fetch_from_web.append(item)
-        
+
         items_to_download = items_to_fetch_from_web
         
     total_items = len(items_to_download)
     if not items_to_download and not seen_uniprots:
-        print("No valid protein IDs found in the provided TSV files.")
+        print("No valid protein IDs found in the provided input files.")
         return
         
     if total_items > 0:
@@ -296,45 +354,28 @@ def main():
     else:
         print(f"\n\nSuccessfully downloaded {len(seen_uniprots)} FASTA sequences.")
     
-    # Process each TSV and create YAMLs
+    # Process each input file and create YAMLs
     total_processed = 0
     all_out_dirs = set()
-    
-    for (tsv_file, lines, id_idx, id_type), out_dir, fasta_dir in zip(tsv_data, out_dirs, fasta_dirs):
-        if not lines or id_idx == -1:
-            continue
-            
+
+    for (input_file, file_type, data, param1, param2), out_dir, fasta_dir in zip(input_data, out_dirs, fasta_dirs):
         processed_count = 0
         all_out_dirs.add(out_dir)
-        
-        for i, line in enumerate(lines[1:], start=2):
-            line = line.strip('\n')
-            if not line:
+
+        if file_type == 'fasta':
+            # Process FASTA input: data contains list of UniProt IDs
+            uniprot_ids = data
+            if not uniprot_ids:
                 continue
-                
-            parts = line.split('\t')
-            if len(parts) <= id_idx:
-                continue
-                
-            id_str = parts[id_idx]
-            if not id_str.strip():
-                continue
-                
-            ids_to_process = []
-            if id_str.startswith("COMPLEX:"):
-                complex_ids = id_str.replace("COMPLEX:", "").split("_")
-                ids_to_process.extend(complex_ids)
-            else:
-                ids_to_process.append(id_str)
-                
-            for u_id in ids_to_process:
+
+            for u_id in uniprot_ids:
                 if not u_id:
                     continue
-                    
+
                 seq = seen_uniprots.get(u_id)
                 if not seq:
                     continue
-                    
+
                 # Create YAML specific to Boltz-2 format
                 msa_path = ""
                 if args.a3m:
@@ -353,27 +394,102 @@ sequences:
       id: B
       smiles: '{smiles_string}'
 """
-                
+
                 # Save YAML file
                 if args.out_type in ['job', 'both']:
                     out_filename = f"{u_id}_{smiles_basename}.yaml"
                     out_filepath = os.path.join(out_dir, out_filename)
-                    
+
                     with open(out_filepath, 'w', encoding='utf-8') as out_f:
                         out_f.write(yaml_content)
-                    
+
                 # Save FASTA file
                 if args.out_type in ['fasta', 'both']:
                     fasta_filename = f"{u_id}.fasta"
                     fasta_filepath = os.path.join(fasta_dir, fasta_filename)
-                    
+
                     with open(fasta_filepath, 'w', encoding='utf-8') as fasta_f:
                         fasta_f.write(f">{u_id}\n{seq}\n")
-                    
+
                 processed_count += 1
                 total_processed += 1
-                
-        out_msg = f"File '{tsv_file}': Generated {processed_count} files"
+
+        elif file_type == 'tsv':
+            # Process TSV input: data contains lines, param1=id_idx, param2=id_type
+            lines = data
+            id_idx = param1
+            id_type = param2
+
+            if not lines or id_idx == -1:
+                continue
+
+            for i, line in enumerate(lines[1:], start=2):
+                line = line.strip('\n')
+                if not line:
+                    continue
+
+                parts = line.split('\t')
+                if len(parts) <= id_idx:
+                    continue
+
+                id_str = parts[id_idx]
+                if not id_str.strip():
+                    continue
+
+                ids_to_process = []
+                if id_str.startswith("COMPLEX:"):
+                    complex_ids = id_str.replace("COMPLEX:", "").split("_")
+                    ids_to_process.extend(complex_ids)
+                else:
+                    ids_to_process.append(id_str)
+
+                for u_id in ids_to_process:
+                    if not u_id:
+                        continue
+
+                    seq = seen_uniprots.get(u_id)
+                    if not seq:
+                        continue
+
+                    # Create YAML specific to Boltz-2 format
+                    msa_path = ""
+                    if args.a3m:
+                        possible_a3m = os.path.join(args.a3m, f"{u_id}.a3m")
+                        if os.path.exists(possible_a3m):
+                            # Use forward slash for yaml path safety
+                            abs_a3m = os.path.abspath(possible_a3m).replace('\\', '/')
+                            msa_path = f"\n      msa: {abs_a3m}"
+
+                    yaml_content = f"""version: 1
+sequences:
+  - protein:
+      id: A
+      sequence: {seq}{msa_path}
+  - ligand:
+      id: B
+      smiles: '{smiles_string}'
+"""
+
+                    # Save YAML file
+                    if args.out_type in ['job', 'both']:
+                        out_filename = f"{u_id}_{smiles_basename}.yaml"
+                        out_filepath = os.path.join(out_dir, out_filename)
+
+                        with open(out_filepath, 'w', encoding='utf-8') as out_f:
+                            out_f.write(yaml_content)
+
+                    # Save FASTA file
+                    if args.out_type in ['fasta', 'both']:
+                        fasta_filename = f"{u_id}.fasta"
+                        fasta_filepath = os.path.join(fasta_dir, fasta_filename)
+
+                        with open(fasta_filepath, 'w', encoding='utf-8') as fasta_f:
+                            fasta_f.write(f">{u_id}\n{seq}\n")
+
+                    processed_count += 1
+                    total_processed += 1
+
+        out_msg = f"File '{input_file}': Generated {processed_count} files"
         if args.out_type in ['job', 'both']:
             out_msg += f" in '{out_dir}'"
         if args.out_type in ['fasta', 'both']:
